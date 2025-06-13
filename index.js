@@ -11,9 +11,10 @@ require('dotenv').config();
 class SolanaAutoRegister {
     constructor() {
         this.results = [];
-        this.mainAccountToken = process.env.MAIN_ACCOUNT_TOKEN;
+        this.mainAccountRefreshToken = process.env.MAIN_ACCOUNT_REFRESH_TOKEN;
         this.mainAccountAddress = process.env.MAIN_ACCOUNT_ADDRESS;
         this.proxy = process.env.PROXY;
+        this.currentAccessToken = null;
     }
 
     createAxiosInstance(proxy = null) {
@@ -67,6 +68,32 @@ class SolanaAutoRegister {
         }
     }
 
+    async refreshAccessToken() {
+        try {
+            const url = 'https://securetoken.googleapis.com/v1/token?key=AIzaSyBDdwO2O_Ose7LICa-A78qKJUCEE3nAwsM';
+            const payload = `grant_type=refresh_token&refresh_token=${this.mainAccountRefreshToken}`;
+            const headers = {
+                'content-type': 'application/x-www-form-urlencoded',
+                'x-client-version': 'Chrome/JsCore/11.6.0/FirebaseCore-web',
+                'x-firebase-gmpid': '1:976084784386:web:bb57c2b7c2642ce85b1e1b'
+            };
+            
+            const response = await this.makeRequest('POST', url, payload, headers, this.proxy);
+            this.currentAccessToken = response.access_token;
+            return response.access_token;
+        } catch (error) {
+            console.error(chalk.red('[ERROR] Failed to refresh access token:'), error.message);
+            throw error;
+        }
+    }
+
+    async ensureValidAccessToken() {
+        if (!this.currentAccessToken) {
+            await this.refreshAccessToken();
+        }
+        return this.currentAccessToken;
+    }
+
     generateWallet() {
         try {
             const keypair = Keypair.generate();
@@ -109,18 +136,36 @@ class SolanaAutoRegister {
 
     async generateInviteCode() {
         try {
+            await this.ensureValidAccessToken();
+            
             const url = 'https://quant-api.opengradient.ai/api/invite/generate';
             const payload = {
                 address: this.mainAccountAddress
             };
             const headers = {
-                'authorization': `Bearer ${this.mainAccountToken}`,
+                'authorization': `Bearer ${this.currentAccessToken}`,
                 'content-type': 'application/json'
             };
             
             const response = await this.makeRequest('POST', url, payload, headers, this.proxy);
             return response.invite_code;
         } catch (error) {
+            if (error.response && error.response.status === 401) {
+                console.log(chalk.yellow('[WARNING] Access token expired, refreshing...'));
+                await this.refreshAccessToken();
+                
+                const url = 'https://quant-api.opengradient.ai/api/invite/generate';
+                const payload = {
+                    address: this.mainAccountAddress
+                };
+                const headers = {
+                    'authorization': `Bearer ${this.currentAccessToken}`,
+                    'content-type': 'application/json'
+                };
+                
+                const response = await this.makeRequest('POST', url, payload, headers, this.proxy);
+                return response.invite_code;
+            }
             console.error(chalk.red('[ERROR] Failed to generate invite code:'), error.message);
             throw error;
         }
@@ -288,8 +333,8 @@ class SolanaAutoRegister {
     }
 
     validateEnvironment() {
-        if (!this.mainAccountToken) {
-            console.error(chalk.red('❌ MAIN_ACCOUNT_TOKEN is required in .env file!'));
+        if (!this.mainAccountRefreshToken) {
+            console.error(chalk.red('❌ MAIN_ACCOUNT_REFRESH_TOKEN is required in .env file!'));
             return false;
         }
         if (!this.mainAccountAddress) {
@@ -316,9 +361,12 @@ class SolanaAutoRegister {
         }
 
         console.log(chalk.green('✅ Environment variables loaded!'));
-        console.log(chalk.blue('🔑 Main account token:'), chalk.white(this.mainAccountToken.slice(0, 40) + '...'));
-        console.log(chalk.blue('👤 Main account:'), chalk.white(this.mainAccountAddress));
+        console.log(chalk.blue('🔑 Main account refresh token:'), chalk.white(this.mainAccountRefreshToken.slice(0, 40) + '...'));
+        console.log(chalk.blue('👤 Main account address:'), chalk.white(this.mainAccountAddress));
         console.log(chalk.blue('🌐 Using proxy:'), chalk.white(this.proxy));
+        console.log(chalk.yellow('🔄 Getting access token...'));
+        await this.refreshAccessToken();
+        console.log(chalk.green('✅ Access token obtained!:'), chalk.white(this.currentAccessToken.slice(0, 40) + '...'));
         console.log('');
 
         const userInput = await this.getUserInput();
