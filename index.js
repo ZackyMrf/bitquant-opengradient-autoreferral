@@ -13,8 +13,38 @@ class SolanaAutoRegister {
         this.results = [];
         this.mainAccountRefreshToken = process.env.MAIN_ACCOUNT_REFRESH_TOKEN;
         this.mainAccountAddress = process.env.MAIN_ACCOUNT_ADDRESS;
-        this.proxy = process.env.PROXY;
         this.currentAccessToken = null;
+        // Multiple proxies loaded from proxy.txt
+        this.proxies = this.loadProxies('proxy.txt');
+    }
+
+    loadProxies(filename) {
+        try {
+            if (!fs.existsSync(filename)) {
+                console.error(chalk.red(`❌ Proxy file "${filename}" not found! Please provide proxy.txt`));
+                process.exit(1);
+            }
+            const lines = fs.readFileSync(filename, 'utf-8').split('\n')
+                .map(line => line.trim()).filter(Boolean);
+            if (!lines.length) {
+                console.error(chalk.red('❌ No proxies found in proxy.txt!'));
+                process.exit(1);
+            }
+            console.log(chalk.green(`✅ Loaded ${lines.length} proxies from proxy.txt`));
+            return lines;
+        } catch (error) {
+            console.error(chalk.red('❌ Failed to load proxies:'), error.message);
+            process.exit(1);
+        }
+    }
+
+    getRandomProxy(excludeSet = new Set()) {
+        const available = this.proxies.filter(p => !excludeSet.has(p));
+        if (available.length === 0) {
+            // Reset if all proxies have been tried
+            return this.proxies[Math.floor(Math.random() * this.proxies.length)];
+        }
+        return available[Math.floor(Math.random() * available.length)];
     }
 
     createAxiosInstance(proxy = null) {
@@ -33,39 +63,62 @@ class SolanaAutoRegister {
                 'sec-fetch-mode': 'cors',
                 'sec-fetch-site': 'cross-site',
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'
-              }
+            }
         };
 
         if (proxy) {
             config.httpsAgent = new HttpsProxyAgent(proxy);
             config.httpAgent = new HttpsProxyAgent(proxy);
         }
-        
+
         return axios.create(config);
     }
 
-    async makeRequest(method, url, data = null, headers = {}, proxy = null) {
-        try {
-            const axiosInstance = this.createAxiosInstance(proxy);
-            const config = {
-                method: method,
-                url: url,
-                headers: { ...axiosInstance.defaults.headers, ...headers }
-            };
-            
-            if (data) {
-                config.data = data;
-                if (!headers['content-type']) {
-                    config.headers['content-type'] = 'application/json';
-                }
+    async makeRequest(method, url, data = null, headers = {}, customProxy = null, maxRetries = 5) {
+        let lastError = null;
+        let triedProxies = new Set();
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            let proxy = customProxy;
+            if (!proxy) {
+                proxy = this.getRandomProxy(triedProxies);
+                triedProxies.add(proxy);
             }
-            
-            const response = await axiosInstance(config);
-            return response.data;
-            
-        } catch (error) {
-            throw error;
+            try {
+                const axiosInstance = this.createAxiosInstance(proxy);
+                const config = {
+                    method: method,
+                    url: url,
+                    headers: { ...axiosInstance.defaults.headers, ...headers }
+                };
+
+                if (data) {
+                    config.data = data;
+                    if (!headers['content-type']) {
+                        config.headers['content-type'] = 'application/json';
+                    }
+                }
+
+                const response = await axiosInstance(config);
+                return response.data;
+
+            } catch (error) {
+                lastError = error;
+                // Proxy-related errors: try another proxy
+                if (
+                    error.code === 'ECONNREFUSED' ||
+                    error.code === 'ETIMEDOUT' ||
+                    error.code === 'ECONNRESET' ||
+                    error.message?.includes('proxy') ||
+                    error.message?.includes('timeout') ||
+                    (error.response && error.response.status === 502)
+                ) {
+                    console.log(chalk.yellow(`[WARNING] Proxy failed (${proxy}), trying another...`));
+                    continue;
+                }
+                throw error; // Other errors, do not retry
+            }
         }
+        throw lastError;
     }
 
     async refreshAccessToken() {
@@ -77,8 +130,8 @@ class SolanaAutoRegister {
                 'x-client-version': 'Chrome/JsCore/11.6.0/FirebaseCore-web',
                 'x-firebase-gmpid': '1:976084784386:web:bb57c2b7c2642ce85b1e1b'
             };
-            
-            const response = await this.makeRequest('POST', url, payload, headers, this.proxy);
+            // Proxy di-random
+            const response = await this.makeRequest('POST', url, payload, headers);
             this.currentAccessToken = response.access_token;
             return response.access_token;
         } catch (error) {
@@ -100,7 +153,6 @@ class SolanaAutoRegister {
             const encode = bs58.encode || bs58.default?.encode || bs58;
             const privateKey = typeof encode === 'function' ? encode(keypair.secretKey) : bs58(keypair.secretKey);
             const address = keypair.publicKey.toString();
-            
             return {
                 privateKey,
                 address,
@@ -122,7 +174,7 @@ class SolanaAutoRegister {
         try {
             const decode = bs58.decode || bs58.default?.decode;
             const encode = bs58.encode || bs58.default?.encode || bs58;
-            
+
             const keypair = Keypair.fromSecretKey(decode(privateKey));
             const messageBytes = new TextEncoder().encode(message);
             const signature = nacl.sign.detached(messageBytes, keypair.secretKey);
@@ -137,7 +189,7 @@ class SolanaAutoRegister {
     async generateInviteCode() {
         try {
             await this.ensureValidAccessToken();
-            
+
             const url = 'https://quant-api.opengradient.ai/api/invite/generate';
             const payload = {
                 address: this.mainAccountAddress
@@ -146,14 +198,14 @@ class SolanaAutoRegister {
                 'authorization': `Bearer ${this.currentAccessToken}`,
                 'content-type': 'application/json'
             };
-            
-            const response = await this.makeRequest('POST', url, payload, headers, this.proxy);
+
+            const response = await this.makeRequest('POST', url, payload, headers);
             return response.invite_code;
         } catch (error) {
             if (error.response && error.response.status === 401) {
                 console.log(chalk.yellow('[WARNING] Access token expired, refreshing...'));
                 await this.refreshAccessToken();
-                
+
                 const url = 'https://quant-api.opengradient.ai/api/invite/generate';
                 const payload = {
                     address: this.mainAccountAddress
@@ -162,8 +214,7 @@ class SolanaAutoRegister {
                     'authorization': `Bearer ${this.currentAccessToken}`,
                     'content-type': 'application/json'
                 };
-                
-                const response = await this.makeRequest('POST', url, payload, headers, this.proxy);
+                const response = await this.makeRequest('POST', url, payload, headers);
                 return response.invite_code;
             }
             console.error(chalk.red('[ERROR] Failed to generate invite code:'), error.message);
@@ -171,19 +222,19 @@ class SolanaAutoRegister {
         }
     }
 
-    async checkWhitelist(address, proxy = null) {
+    async checkWhitelist(address) {
         const url = `https://quant-api.opengradient.ai/api/whitelisted?address=${address}`;
-        return await this.makeRequest('GET', url, null, {}, proxy);
+        return await this.makeRequest('GET', url);
     }
 
-    async autoRegister(address, inviteCode, proxy = null) {
+    async autoRegister(address, inviteCode) {
         try {
             const url = 'https://quant-api.opengradient.ai/api/invite/use';
             const payload = {
                 code: inviteCode,
                 address: address
             };
-            await this.makeRequest('POST', url, payload, {}, proxy);
+            await this.makeRequest('POST', url, payload);
             return true;
         } catch (error) {
             console.error(chalk.red(`[ERROR] Registration failed for ${address}:`), error.message);
@@ -191,33 +242,33 @@ class SolanaAutoRegister {
         }
     }
 
-    async authWallet(address, message, signature, proxy = null) {
+    async authWallet(address, message, signature) {
         const url = 'https://quant-api.opengradient.ai/api/verify/solana';
         const payload = { address, message, signature };
-        return await this.makeRequest('POST', url, payload, {}, proxy);
+        return await this.makeRequest('POST', url, payload);
     }
 
-    async accountSign(token, proxy = null) {
+    async accountSign(token) {
         const url = 'https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=AIzaSyBDdwO2O_Ose7LICa-A78qKJUCEE3nAwsM';
         const payload = { token: token, returnSecureToken: true };
         const headers = {
             'x-client-version': 'Chrome/JsCore/11.6.0/FirebaseCore-web',
             'x-firebase-gmpid': '1:976084784386:web:bb57c2b7c2642ce85b1e1b'
         };
-        return await this.makeRequest('POST', url, payload, headers, proxy);
+        return await this.makeRequest('POST', url, payload, headers);
     }
 
-    async accountLookup(idToken, proxy = null) {
+    async accountLookup(idToken) {
         const url = 'https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=AIzaSyBDdwO2O_Ose7LICa-A78qKJUCEE3nAwsM';
         const payload = { idToken: idToken };
         const headers = {
             'x-client-version': 'Chrome/JsCore/11.6.0/FirebaseCore-web',
             'x-firebase-gmpid': '1:976084784386:web:bb57c2b7c2642ce85b1e1b'
         };
-        return await this.makeRequest('POST', url, payload, headers, proxy);
+        return await this.makeRequest('POST', url, payload, headers);
     }
 
-    async getToken(refreshToken, proxy = null) {
+    async getToken(refreshToken) {
         const url = 'https://securetoken.googleapis.com/v1/token?key=AIzaSyBDdwO2O_Ose7LICa-A78qKJUCEE3nAwsM';
         const payload = `grant_type=refresh_token&refresh_token=${refreshToken}`;
         const headers = {
@@ -225,16 +276,16 @@ class SolanaAutoRegister {
             'x-client-version': 'Chrome/JsCore/11.6.0/FirebaseCore-web',
             'x-firebase-gmpid': '1:976084784386:web:bb57c2b7c2642ce85b1e1b'
         };
-        return await this.makeRequest('POST', url, payload, headers, proxy);
+        return await this.makeRequest('POST', url, payload, headers);
     }
 
-    async getStatus(address, accessToken, proxy = null) {
+    async getStatus(address, accessToken) {
         const url = `https://quant-api.opengradient.ai/api/activity/stats?address=${address}`;
         const headers = {
             'authorization': `Bearer ${accessToken}`,
             'content-type': 'application/json'
         };
-        return await this.makeRequest('GET', url, null, headers, proxy);
+        return await this.makeRequest('GET', url, null, headers);
     }
 
     async sleep(ms) {
@@ -245,37 +296,37 @@ class SolanaAutoRegister {
         try {
             console.log(chalk.cyan(`[${index}]`), chalk.yellow('🔄 Generating new wallet...'));
             const wallet = this.generateWallet();
-            
+
             console.log(chalk.cyan(`[${index}]`), chalk.blue('📱 Generated address:'), chalk.white(wallet.address));
-            
+
             console.log(chalk.cyan(`[${index}]`), chalk.yellow('🎫 Generating invite code...'));
             const inviteCode = await this.generateInviteCode();
             console.log(chalk.cyan(`[${index}]`), chalk.green('✅ Generated invite code:'), chalk.white(inviteCode));
-            
+
             console.log(chalk.cyan(`[${index}]`), chalk.yellow('📝 Attempting registration...'));
-            const registerSuccess = await this.autoRegister(wallet.address, inviteCode, this.proxy);
-            
+            const registerSuccess = await this.autoRegister(wallet.address, inviteCode);
+
             if (!registerSuccess) {
                 console.log(chalk.cyan(`[${index}]`), chalk.red('❌ Registration failed, skipping...'));
                 return null;
             }
 
             console.log(chalk.cyan(`[${index}]`), chalk.green('✅ Registration successful! Authenticating...'));
-            
+
             const message = this.createSignatureMessage(wallet.address);
             const signature = this.signMessage(message, wallet.privateKey);
-            const authResult = await this.authWallet(wallet.address, message, signature, this.proxy);
+            const authResult = await this.authWallet(wallet.address, message, signature);
 
             console.log(chalk.cyan(`[${index}]`), chalk.green('🔐 Authentication successful! Getting tokens...'));
-            
-            const signResult = await this.accountSign(authResult.token, this.proxy);
-            await this.accountLookup(signResult.idToken, this.proxy);
-            const tokenResult = await this.getToken(signResult.refreshToken, this.proxy);
+
+            const signResult = await this.accountSign(authResult.token);
+            await this.accountLookup(signResult.idToken);
+            const tokenResult = await this.getToken(signResult.refreshToken);
             const accessToken = tokenResult.access_token;
 
             console.log(chalk.cyan(`[${index}]`), chalk.yellow('📊 Getting account stats...'));
-            
-            const status = await this.getStatus(wallet.address, accessToken, this.proxy);
+
+            const status = await this.getStatus(wallet.address, accessToken);
 
             const result = {
                 privateKey: wallet.privateKey,
@@ -284,8 +335,8 @@ class SolanaAutoRegister {
                 stats: status
             };
 
-            console.log(chalk.cyan(`[${index}]`), chalk.green('🎉 Success!'), 
-                       chalk.magenta('Points:'), chalk.white(status.points || 0), 
+            console.log(chalk.cyan(`[${index}]`), chalk.green('🎉 Success!'),
+                chalk.magenta('Points:'), chalk.white(status.points || 0),
                 chalk.magenta('Messages:'), chalk.white(`${status.message_count || 0}/${status.daily_message_limit || 0}`));
             console.log(chalk.cyan(`[${index}]`), chalk.green('🔗 Success referred to'), chalk.white(this.mainAccountAddress));
 
@@ -316,7 +367,7 @@ class SolanaAutoRegister {
             input: process.stdin,
             output: process.stdout
         });
-    
+
         return new Promise((resolve) => {
             rl.question(chalk.yellow('How many wallets to register?: '), (walletCount) => {
                 rl.close();
@@ -341,10 +392,7 @@ class SolanaAutoRegister {
             console.error(chalk.red('❌ MAIN_ACCOUNT_ADDRESS is required in .env file!'));
             return false;
         }
-        if (!this.proxy) {
-            console.error(chalk.red('❌ PROXY is required in .env file!'));
-            return false;
-        }
+        // Don't check single proxy env, we use proxy.txt now!
         return true;
     }
 
@@ -355,7 +403,7 @@ class SolanaAutoRegister {
     ║    Github: https://github.com/im-hanzou      ║
     ╚══════════════════════════════════════════════╝
     `));
-        
+
         if (!this.validateEnvironment()) {
             return;
         }
@@ -363,7 +411,7 @@ class SolanaAutoRegister {
         console.log(chalk.green('✅ Environment variables loaded!'));
         console.log(chalk.blue('🔑 Main account refresh token:'), chalk.white(this.mainAccountRefreshToken.slice(0, 40) + '...'));
         console.log(chalk.blue('👤 Main account address:'), chalk.white(this.mainAccountAddress));
-        console.log(chalk.blue('🌐 Using proxy:'), chalk.white(this.proxy));
+        console.log(chalk.blue('🌐 Using proxies from:'), chalk.white('proxy.txt'));
         console.log(chalk.yellow('🔄 Getting access token...'));
         await this.refreshAccessToken();
         console.log(chalk.green('✅ Access token obtained!:'), chalk.white(this.currentAccessToken.slice(0, 40) + '...'));
@@ -381,7 +429,7 @@ class SolanaAutoRegister {
             console.log(chalk.gray('━'.repeat(50)));
 
             const result = await this.processWallet(i);
-            
+
             if (result) {
                 this.results.push(result);
                 await this.saveResult(result, i);
@@ -393,7 +441,7 @@ class SolanaAutoRegister {
         console.log(chalk.magenta('📈 SUMMARY:'));
         console.log(chalk.white(`   ✅ Successfully registered: ${successCount}/${walletCount} wallets`));
         console.log(chalk.white(`   💾 Results saved to: wallets.txt`));
-        
+
         if (successCount > 0) {
             console.log(chalk.white(`   🌟 Total ${successCount} wallets succesfully registered!\n`));
         }
